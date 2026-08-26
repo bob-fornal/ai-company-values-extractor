@@ -56,6 +56,10 @@ markdown report.
   "culture": ["..."],
   "summary": "...",
   "sourcePages": ["https://example.com/", "https://example.com/about"],
+  "pageStats": [
+    { "url": "https://example.com/", "source": "plain", "textLength": 1840 },
+    { "url": "https://example.com/about", "source": "browser-rendering", "textLength": 3021 }
+  ],
   "skippedPages": [
     { "url": "https://example.com/careers", "status": 404, "error": null }
   ],
@@ -65,11 +69,16 @@ markdown report.
 }
 ```
 
-`report` is only present when calling `/extract/full`. `skippedPages` lists
-any candidate page that couldn't be used, with its HTTP status and/or error
-message — check it (or `wrangler tail` / the dashboard's real-time Logs,
-where the same detail is logged) if a page you expected in `sourcePages`
-is missing.
+`report` is only present when calling `/extract/full`. `pageStats` tells
+you how each page in `sourcePages` was actually fetched — `"plain"` means
+a plain `fetch()` was used as-is; `"browser-rendering"` means the plain
+fetch looked thin and the Browser Rendering fallback (see below) was used
+instead. If a page you expected to be JS-rendered still shows `"plain"`,
+either Browser Rendering isn't configured (see the setup steps below) or
+the fallback failed — check `wrangler tail` / the dashboard's real-time
+Logs, where the reason is logged either way. `skippedPages` lists any
+candidate page that couldn't be used at all, with its HTTP status and/or
+error message.
 
 ## Handling JavaScript-rendered (SPA) pages
 
@@ -83,9 +92,14 @@ it, on an otherwise normal-looking page, is the typical symptom.
 
 To fix this, the Worker can fall back to rendering a candidate page with
 Cloudflare's
-[Browser Rendering `/json` quick action](https://developers.cloudflare.com/browser-rendering/rest-api/json-endpoint/),
+[Browser Rendering `/markdown` quick action](https://developers.cloudflare.com/browser-rendering/rest-api/markdown-endpoint/),
 which spins up a real headless browser, waits for JavaScript to run, and
-uses AI to hand back the fully rendered visible text. This is opt-in:
+converts the fully rendered page to markdown. (An earlier version of this
+used the `/json` quick action, which uses an AI model internally — that
+model reliably failed to escape a full page's worth of text into a valid
+JSON string, returning `HTTP 422` on every real page. `/markdown` does a
+mechanical HTML-to-markdown conversion with no AI step, so that failure
+mode doesn't exist.) This is opt-in:
 
 1. **Create an API token** at
    [dash.cloudflare.com/profile/api-tokens](https://dash.cloudflare.com/profile/api-tokens)

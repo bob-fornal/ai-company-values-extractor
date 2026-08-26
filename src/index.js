@@ -119,13 +119,16 @@ async function handleExtract(request, env, includeReport) {
     return jsonResponse({ error: `Invalid URL: ${rawUrl}` }, 400);
   }
  
-  const maxChars = parseInt(env.MAX_PAGE_CHARS ?? "8000", 10);
+  const maxChars = parseInt(env.MAX_PAGE_CHARS ?? "30000", 10);
   const timeoutMs = parseInt(env.FETCH_TIMEOUT_MS ?? "8000", 10);
   const renderTimeoutMs = parseInt(env.BROWSER_RENDER_TIMEOUT_MS ?? "25000", 10);
 
   // ── Crawl candidate pages ─────────────────────────────────────────────────
   const crawlResults = await crawlPages(baseUrl, CANDIDATE_PATHS, timeoutMs, renderTimeoutMs, env);
   const sourcePages = crawlResults.filter((r) => r.ok).map((r) => r.url);
+  const pageStats = crawlResults
+    .filter((r) => r.ok)
+    .map((r) => ({ url: r.url, source: r.source ?? "plain", textLength: r.text.length }));
   const skippedPages = crawlResults
     .filter((r) => !r.ok)
     .map((r) => ({ url: r.url, status: r.status ?? null, error: r.error ?? null }));
@@ -158,6 +161,7 @@ async function handleExtract(request, env, includeReport) {
   const result = {
     ...extraction,
     sourcePages,
+    pageStats,
     skippedPages,
     model: MODEL,
     generatedAt: new Date().toISOString(),
@@ -203,20 +207,37 @@ function looksThin(textLength, htmlLength) {
 
 /**
  * Fetch a page's text content. Tries a plain fetch() first (cheap, fast).
- * If the result looks thin relative to the raw HTML — a sign the page is
- * client-side-rendered (Angular/React/Vue SPA) and real content never made
- * it into the server response — and CLOUDFLARE_ACCOUNT_ID /
- * CLOUDFLARE_API_TOKEN are configured, falls back to Cloudflare's Browser
- * Rendering /json quick action, which actually runs the page's JavaScript.
+ * A definitive HTTP error status (e.g. 404) is trusted as-is — the path
+ * doesn't exist, and rendering it anyway risks a SPA's client-side routing
+ * fallback substituting unrelated homepage content in as if it came from
+ * this path. Otherwise, if the result looks thin relative to the raw HTML
+ * — a sign the page is client-side-rendered (Angular/React/Vue SPA) and
+ * real content never made it into the server response — and
+ * CLOUDFLARE_ACCOUNT_ID / CLOUDFLARE_API_TOKEN are configured, falls back
+ * to Cloudflare's Browser Rendering /markdown quick action, which actually
+ * runs the page's JavaScript.
  */
 async function fetchPage(url, timeoutMs, renderTimeoutMs, env) {
   const plain = await fetchPagePlain(url, timeoutMs);
 
+  // A definitive non-2xx status means the origin itself says this path
+  // doesn't exist. Don't "rescue" it with a render: a full browser
+  // navigation can hit a SPA's client-side routing fallback and render the
+  // homepage for an unmapped route even though a plain fetch() correctly
+  // got a real 404 — silently substituting unrelated homepage content in
+  // as if it came from this path.
+  if (plain.status != null && !plain.ok) return plain;
+
   const canRender = env?.CLOUDFLARE_ACCOUNT_ID && env?.CLOUDFLARE_API_TOKEN;
-  if (!canRender) return plain;
+  if (!canRender) {
+    console.warn(`Browser Rendering not configured (CLOUDFLARE_ACCOUNT_ID/CLOUDFLARE_API_TOKEN unset) — using plain fetch only for ${url}`);
+    return plain;
+  }
   if (plain.ok && !looksThin(plain.text.length, plain.htmlLength)) return plain;
 
+  console.warn(`${url} looks thin (${plain.text.length} chars / ${plain.htmlLength} html) — falling back to Browser Rendering`);
   const rendered = await fetchPageViaBrowserRendering(url, renderTimeoutMs, env);
+  console.warn(`Browser Rendering for ${url} ${rendered ? "succeeded" : "failed, keeping plain fetch result"}`);
   return rendered ?? plain;
 }
 
@@ -237,6 +258,7 @@ async function fetchPagePlain(url, timeoutMs) {
 
     if (!res.ok) {
       console.warn(`Plain fetch failed for ${url}: HTTP ${res.status}`);
+      await res.body?.cancel().catch(() => {});
       return { url, ok: false, text: "", htmlLength: 0, status: res.status };
     }
 
@@ -254,9 +276,12 @@ async function fetchPagePlain(url, timeoutMs) {
 }
 
 /**
- * Render the page with Cloudflare's Browser Rendering REST API and use its
- * built-in AI extraction to pull out the fully rendered visible text.
- * https://developers.cloudflare.com/browser-rendering/rest-api/json-endpoint/
+ * Render the page with Cloudflare's Browser Rendering REST API and convert
+ * it to markdown. Unlike the /json quick action, /markdown does a
+ * mechanical HTML-to-markdown conversion with no AI step — no risk of the
+ * model failing to escape several KB of page text into a valid JSON string
+ * (which is exactly what made /json return HTTP 422 on every real page).
+ * https://developers.cloudflare.com/browser-rendering/rest-api/markdown-endpoint/
  * Returns null (rather than throwing) on any failure so the caller can fall
  * back to a plain fetch.
  */
@@ -265,7 +290,7 @@ async function fetchPageViaBrowserRendering(url, timeoutMs, env) {
   const timer = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
-    const endpoint = `https://api.cloudflare.com/client/v4/accounts/${env.CLOUDFLARE_ACCOUNT_ID}/browser-rendering/json`;
+    const endpoint = `https://api.cloudflare.com/client/v4/accounts/${env.CLOUDFLARE_ACCOUNT_ID}/browser-rendering/markdown`;
     const res = await fetch(endpoint, {
       method: "POST",
       signal: controller.signal,
@@ -273,31 +298,19 @@ async function fetchPageViaBrowserRendering(url, timeoutMs, env) {
         Authorization: `Bearer ${env.CLOUDFLARE_API_TOKEN}`,
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({
-        url,
-        prompt:
-          "Extract the full visible text content of this page in reading order, exactly as written, including any content that is rendered by JavaScript. Do not summarize or omit anything.",
-        response_format: {
-          type: "json_schema",
-          json_schema: {
-            type: "object",
-            properties: { text: { type: "string" } },
-            required: ["text"],
-          },
-        },
-      }),
+      body: JSON.stringify({ url }),
     });
 
     if (!res.ok) {
       const body = await res.text().catch(() => "");
-      console.warn(`Browser Rendering /json failed for ${url}: HTTP ${res.status} — ${body.slice(0, 500)}`);
+      console.warn(`Browser Rendering /markdown failed for ${url}: HTTP ${res.status} — ${body.slice(0, 500)}`);
       return null;
     }
 
     const data = await res.json();
-    const text = data?.result?.text;
+    const text = data?.result;
     if (typeof text !== "string" || text.length <= 100) {
-      console.warn(`Browser Rendering /json returned unusable text for ${url}: ${JSON.stringify(data).slice(0, 500)}`);
+      console.warn(`Browser Rendering /markdown returned unusable text for ${url}: ${JSON.stringify(data).slice(0, 500)}`);
       return null;
     }
 
@@ -309,7 +322,7 @@ async function fetchPageViaBrowserRendering(url, timeoutMs, env) {
       source: "browser-rendering",
     };
   } catch (err) {
-    console.warn(`Browser Rendering /json threw for ${url}: ${err.name} — ${err.message}`);
+    console.warn(`Browser Rendering /markdown threw for ${url}: ${err.name} — ${err.message}`);
     return null;
   } finally {
     clearTimeout(timer);
@@ -339,14 +352,21 @@ function stripHtml(html) {
  
 /**
  * Combine successful page text, de-duplicate content, and cap total length.
- * The homepage gets more budget; other pages share the remainder equally.
+ * The homepage gets a modest head start; other pages share the remainder
+ * equally. Browser-rendered pages carry nav/logo/frontmatter markdown
+ * overhead before any real body content starts, so per-page budgets need
+ * real headroom — a page's actual content of interest can sit well past
+ * the first ~1,500-2,000 characters even though that would look "enough"
+ * for plain server-rendered HTML.
  */
 function buildContext(crawlResults, maxTotalChars) {
   const successful = crawlResults.filter((r) => r.ok && r.text.length > 0);
   if (successful.length === 0) return "";
- 
-  // Give the first result (homepage) up to 40 % of the budget
-  const homeBudget = Math.floor(maxTotalChars * 0.4);
+
+  // Give the first result (homepage) a modest head start — 25 % of the
+  // budget — rather than the outsized share it had before, since every
+  // page needs enough room to get past its own nav/frontmatter overhead.
+  const homeBudget = Math.floor(maxTotalChars * 0.25);
   const otherBudget = Math.floor((maxTotalChars - homeBudget) / Math.max(1, successful.length - 1));
  
   const chunks = successful.map((r, i) => {
