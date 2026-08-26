@@ -1,0 +1,25 @@
+name = "company-values-extractor"
+main = "src/index.js"
+compatibility_date = "2024-11-01"
+compatibility_flags = ["nodejs_compat"]
+workers_dev = true
+preview_urls = true
+
+[ai]
+binding = "AI"
+
+[vars]
+# Max characters to send to the AI per page (keep cost/latency manageable)
+MAX_PAGE_CHARS = "8000"
+# Request timeout in milliseconds for fetching target pages
+FETCH_TIMEOUT_MS = "8000"
+
+# Optional: lock down who can call the worker
+# Uncomment and set a secret with `wrangler secret put API_KEY`
+# [[rules]]
+# type = "Text"
+
+# Uncomment to add KV storage for caching results
+# [[kv_namespaces]]
+# binding = "CACHE"
+# id = "YOUR_KV_NAMESPACE_ID"
