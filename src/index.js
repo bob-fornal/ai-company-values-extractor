@@ -121,15 +121,24 @@ async function handleExtract(request, env, includeReport) {
  
   const maxChars = parseInt(env.MAX_PAGE_CHARS ?? "8000", 10);
   const timeoutMs = parseInt(env.FETCH_TIMEOUT_MS ?? "8000", 10);
- 
+  const renderTimeoutMs = parseInt(env.BROWSER_RENDER_TIMEOUT_MS ?? "25000", 10);
+
   // ── Crawl candidate pages ─────────────────────────────────────────────────
-  const crawlResults = await crawlPages(baseUrl, CANDIDATE_PATHS, timeoutMs);
+  const crawlResults = await crawlPages(baseUrl, CANDIDATE_PATHS, timeoutMs, renderTimeoutMs, env);
   const sourcePages = crawlResults.filter((r) => r.ok).map((r) => r.url);
- 
+  const skippedPages = crawlResults
+    .filter((r) => !r.ok)
+    .map((r) => ({ url: r.url, status: r.status ?? null, error: r.error ?? null }));
+
+  if (skippedPages.length > 0) {
+    console.warn("Skipped candidate pages:", JSON.stringify(skippedPages));
+  }
+
   if (sourcePages.length === 0) {
     return jsonResponse({
       error: "Could not fetch any pages from the provided URL.",
       attempted: crawlResults.map((r) => r.url),
+      skippedPages,
     }, 502);
   }
  
@@ -149,6 +158,7 @@ async function handleExtract(request, env, includeReport) {
   const result = {
     ...extraction,
     sourcePages,
+    skippedPages,
     model: MODEL,
     generatedAt: new Date().toISOString(),
   };
@@ -166,21 +176,54 @@ function normalizeBase(raw) {
   return `${u.protocol}//${u.host}`;
 }
  
-async function crawlPages(baseUrl, paths, timeoutMs) {
+async function crawlPages(baseUrl, paths, timeoutMs, renderTimeoutMs, env) {
   const results = await Promise.allSettled(
-    paths.map((path) => fetchPage(`${baseUrl}${path}`, timeoutMs))
+    paths.map((path) => fetchPage(`${baseUrl}${path}`, timeoutMs, renderTimeoutMs, env))
   );
- 
+
   return results.map((r, i) => {
     if (r.status === "fulfilled") return r.value;
     return { url: `${baseUrl}${paths[i]}`, ok: false, text: "", error: r.reason?.message };
   });
 }
- 
-async function fetchPage(url, timeoutMs) {
+
+/**
+ * A page's extracted text is a small fraction of its raw HTML — the
+ * hallmark of a client-side-rendered shell where real content is injected
+ * by JavaScript that a plain fetch() never runs. `minChars` is a floor for
+ * near-empty pages where the ratio isn't meaningful.
+ */
+const THIN_CONTENT_MIN_CHARS = 300;
+const THIN_CONTENT_MIN_RATIO = 0.05;
+
+function looksThin(textLength, htmlLength) {
+  if (textLength < THIN_CONTENT_MIN_CHARS) return true;
+  return htmlLength > 0 && textLength / htmlLength < THIN_CONTENT_MIN_RATIO;
+}
+
+/**
+ * Fetch a page's text content. Tries a plain fetch() first (cheap, fast).
+ * If the result looks thin relative to the raw HTML — a sign the page is
+ * client-side-rendered (Angular/React/Vue SPA) and real content never made
+ * it into the server response — and CLOUDFLARE_ACCOUNT_ID /
+ * CLOUDFLARE_API_TOKEN are configured, falls back to Cloudflare's Browser
+ * Rendering /json quick action, which actually runs the page's JavaScript.
+ */
+async function fetchPage(url, timeoutMs, renderTimeoutMs, env) {
+  const plain = await fetchPagePlain(url, timeoutMs);
+
+  const canRender = env?.CLOUDFLARE_ACCOUNT_ID && env?.CLOUDFLARE_API_TOKEN;
+  if (!canRender) return plain;
+  if (plain.ok && !looksThin(plain.text.length, plain.htmlLength)) return plain;
+
+  const rendered = await fetchPageViaBrowserRendering(url, renderTimeoutMs, env);
+  return rendered ?? plain;
+}
+
+async function fetchPagePlain(url, timeoutMs) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
- 
+
   try {
     const res = await fetch(url, {
       signal: controller.signal,
@@ -191,14 +234,83 @@ async function fetchPage(url, timeoutMs) {
       },
       redirect: "follow",
     });
- 
-    if (!res.ok) return { url, ok: false, text: "", status: res.status };
- 
+
+    if (!res.ok) {
+      console.warn(`Plain fetch failed for ${url}: HTTP ${res.status}`);
+      return { url, ok: false, text: "", htmlLength: 0, status: res.status };
+    }
+
     const html = await res.text();
     const text = stripHtml(html);
-    return { url, ok: text.length > 100, text, status: res.status };
+    const ok = text.length > 100;
+    if (!ok) console.warn(`Plain fetch for ${url} returned only ${text.length} chars of text`);
+    return { url, ok, text, htmlLength: html.length, status: res.status, source: "plain" };
   } catch (err) {
-    return { url, ok: false, text: "", error: err.message };
+    console.warn(`Plain fetch threw for ${url}: ${err.name} — ${err.message}`);
+    return { url, ok: false, text: "", htmlLength: 0, error: err.message };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Render the page with Cloudflare's Browser Rendering REST API and use its
+ * built-in AI extraction to pull out the fully rendered visible text.
+ * https://developers.cloudflare.com/browser-rendering/rest-api/json-endpoint/
+ * Returns null (rather than throwing) on any failure so the caller can fall
+ * back to a plain fetch.
+ */
+async function fetchPageViaBrowserRendering(url, timeoutMs, env) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const endpoint = `https://api.cloudflare.com/client/v4/accounts/${env.CLOUDFLARE_ACCOUNT_ID}/browser-rendering/json`;
+    const res = await fetch(endpoint, {
+      method: "POST",
+      signal: controller.signal,
+      headers: {
+        Authorization: `Bearer ${env.CLOUDFLARE_API_TOKEN}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        url,
+        prompt:
+          "Extract the full visible text content of this page in reading order, exactly as written, including any content that is rendered by JavaScript. Do not summarize or omit anything.",
+        response_format: {
+          type: "json_schema",
+          json_schema: {
+            type: "object",
+            properties: { text: { type: "string" } },
+            required: ["text"],
+          },
+        },
+      }),
+    });
+
+    if (!res.ok) {
+      const body = await res.text().catch(() => "");
+      console.warn(`Browser Rendering /json failed for ${url}: HTTP ${res.status} — ${body.slice(0, 500)}`);
+      return null;
+    }
+
+    const data = await res.json();
+    const text = data?.result?.text;
+    if (typeof text !== "string" || text.length <= 100) {
+      console.warn(`Browser Rendering /json returned unusable text for ${url}: ${JSON.stringify(data).slice(0, 500)}`);
+      return null;
+    }
+
+    return {
+      url,
+      ok: true,
+      text: text.replace(/\s{2,}/g, " ").trim(),
+      status: res.status,
+      source: "browser-rendering",
+    };
+  } catch (err) {
+    console.warn(`Browser Rendering /json threw for ${url}: ${err.name} — ${err.message}`);
+    return null;
   } finally {
     clearTimeout(timer);
   }

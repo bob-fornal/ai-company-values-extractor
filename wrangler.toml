@@ -11,13 +11,29 @@ binding = "AI"
 [vars]
 # Max characters to send to the AI per page (keep cost/latency manageable)
 MAX_PAGE_CHARS = "8000"
-# Request timeout in milliseconds for fetching target pages
+# Request timeout in milliseconds for plain-fetch candidate page requests
 FETCH_TIMEOUT_MS = "8000"
+# Timeout in milliseconds for the Browser Rendering /json fallback — this
+# needs more headroom than a plain fetch since it spins up a real browser
+# and runs an AI extraction pass over the rendered page
+BROWSER_RENDER_TIMEOUT_MS = "25000"
+
+# Optional: your Cloudflare account ID. Set this (as a var, not a secret —
+# it's not sensitive) together with the CLOUDFLARE_API_TOKEN secret below to
+# enable rendering candidate pages with Cloudflare's Browser Rendering
+# /json quick action instead of a plain fetch(). This is required to pick up
+# content that JavaScript renders client-side (e.g. Angular/React SPAs
+# without server-side rendering) — a plain fetch() only sees the initial
+# server HTML and misses that content entirely.
+# CLOUDFLARE_ACCOUNT_ID = "YOUR_ACCOUNT_ID"
+
+# Required alongside CLOUDFLARE_ACCOUNT_ID above.
+# Set with: wrangler secret put CLOUDFLARE_API_TOKEN
+# Create the token at https://dash.cloudflare.com/profile/api-tokens with
+# the "Browser Rendering - Edit" permission.
 
 # Optional: lock down who can call the worker
 # Uncomment and set a secret with `wrangler secret put API_KEY`
-# [[rules]]
-# type = "Text"
 
 # Uncomment to add KV storage for caching results
 # [[kv_namespaces]]
