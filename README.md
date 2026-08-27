@@ -8,14 +8,21 @@ markdown report.
 ## How it works
 
 1. You POST a company URL to the Worker.
-2. The Worker fetches a fixed list of likely pages (`/`, `/about`,
-   `/careers`, `/values`, etc.) and reduces each to plain text — see
-   [Handling JavaScript-rendered pages](#handling-javascript-rendered-spa-pages)
-   below for how that fetch works.
-3. The combined text is sent to Workers AI with a prompt that asks for a
-   strict JSON extraction of company info, mission, vision, values, and
-   culture.
-4. `/extract/full` additionally asks the model to turn that JSON into a
+2. The Worker fetches the homepage, a recommended list of likely pages
+   (`/about`, `/careers`, `/values`, etc.), and any additional pages
+   discovered from the homepage's own links — see
+   [Finding the right pages to crawl](#finding-the-right-pages-to-crawl)
+   below — reducing each to plain text ([Handling JavaScript-rendered
+   pages](#handling-javascript-rendered-spa-pages) covers how that fetch
+   itself works).
+3. If a careers-style page turns up, the Worker looks for a link to an
+   individual job listing on it and, if found, fetches that page too —
+   some companies list their values inside job postings rather than on
+   the careers page itself.
+4. The combined text from every page fetched is sent to Workers AI with a
+   prompt that asks for a strict JSON extraction of company info, mission,
+   vision, values, and culture.
+5. `/extract/full` additionally asks the model to turn that JSON into a
    readable markdown report.
 
 ## Endpoints
@@ -55,14 +62,23 @@ markdown report.
   ],
   "culture": ["..."],
   "summary": "...",
-  "sourcePages": ["https://example.com/", "https://example.com/about"],
+  "sourcePages": [
+    "https://example.com/",
+    "https://example.com/about",
+    "https://example.com/careers",
+    "https://example.com/careers/software-engineer"
+  ],
   "pageStats": [
-    { "url": "https://example.com/", "source": "plain", "textLength": 1840 },
-    { "url": "https://example.com/about", "source": "browser-rendering", "textLength": 3021 }
+    { "url": "https://example.com/", "source": "browser-rendering", "discovery": "recommended", "textLength": 4422 },
+    { "url": "https://example.com/about", "source": "plain", "discovery": "recommended", "textLength": 1840 },
+    { "url": "https://example.com/careers", "source": "browser-rendering", "discovery": "recommended", "textLength": 2610 },
+    { "url": "https://example.com/careers/software-engineer", "source": "browser-rendering", "discovery": "job-listing", "textLength": 3021 }
   ],
   "skippedPages": [
-    { "url": "https://example.com/careers", "status": 404, "error": null }
+    { "url": "https://example.com/values", "status": 404, "error": null }
   ],
+  "discoveredPaths": ["/solutions", "/blog", "/contact"],
+  "jobListingPage": { "url": "https://example.com/careers/software-engineer", "ok": true },
   "model": "@cf/meta/llama-4-scout-17b-16e-instruct",
   "generatedAt": "2026-08-26T00:00:00.000Z",
   "report": "# Company Overview\n..."
@@ -70,15 +86,69 @@ markdown report.
 ```
 
 `report` is only present when calling `/extract/full`. `pageStats` tells
-you how each page in `sourcePages` was actually fetched — `"plain"` means
-a plain `fetch()` was used as-is; `"browser-rendering"` means the plain
-fetch looked thin and the Browser Rendering fallback (see below) was used
-instead. If a page you expected to be JS-rendered still shows `"plain"`,
-either Browser Rendering isn't configured (see the setup steps below) or
-the fallback failed — check `wrangler tail` / the dashboard's real-time
-Logs, where the reason is logged either way. `skippedPages` lists any
-candidate page that couldn't be used at all, with its HTTP status and/or
-error message.
+you how each page in `sourcePages` was actually fetched:
+
+- `source` — `"plain"` means a plain `fetch()` was used as-is;
+  `"browser-rendering"` means the plain fetch looked thin and the Browser
+  Rendering fallback (see below) was used instead. If a page you expected
+  to be JS-rendered still shows `"plain"`, either Browser Rendering isn't
+  configured (see the setup steps below) or the fallback failed — check
+  `wrangler tail` / the dashboard's real-time Logs, where the reason is
+  logged either way.
+- `discovery` — `"recommended"` means the path came from the built-in
+  recommended list; `"root-link"` means it was found by scraping the
+  homepage's own links (see
+  [Finding the right pages to crawl](#finding-the-right-pages-to-crawl));
+  `"job-listing"` means it's the individual job posting followed from a
+  careers page.
+
+`skippedPages` lists any candidate page that couldn't be used at all,
+with its HTTP status and/or error message. `discoveredPaths` lists every
+extra path found from the homepage's links (whether or not it ended up
+fetchable — check `pageStats`/`skippedPages` for that). `jobListingPage`
+is `null` when no careers page was found, or when one was found but no
+individual job listing link could be located on it (e.g. a careers page
+that's just a "contact us to apply" CTA with no job board).
+
+## Finding the right pages to crawl
+
+A fixed guess list of paths (`RECOMMENDED_PATHS` in
+[src/index.js](src/index.js)) is a starting point, not the whole crawl —
+plenty of real sites don't have a `/values` or `/culture` page at all, or
+use different names entirely, while some of the guessed paths simply
+don't exist on a given site. The Worker adapts in two ways:
+
+1. **Homepage link discovery.** The homepage is always fetched first and
+   scraped for its own same-origin links (`discoverPaths()` in
+   [src/index.js](src/index.js)). Anything not already covered by the
+   recommended list becomes an additional candidate page — up to 10,
+   prioritized by whether the URL itself hints at relevant content (looks
+   for words like `about`, `career`, `culture`, `value`, `mission`,
+   `team`, `story`, `people`, etc.). This is how the Worker finds a site's
+   *actual* navigation instead of only guessing at it.
+2. **Careers → job listing follow-up.** If any crawled page's URL
+   contains `career`, the Worker looks at that page's own discovered
+   links for one that looks like an individual job posting (nested under
+   the careers page's path, or containing a word like `job`, `position`,
+   `opening`, `apply`, `role`) and fetches it too. Some companies state
+   their values inside individual job postings rather than on the
+   careers page itself. This only follows same-origin links — a careers
+   page that embeds a third-party job board (Greenhouse, Lever, Workday,
+   etc.) on a different domain isn't followed.
+
+Link discovery depends on already having the page's real, JS-rendered
+content to scrape links out of — on a client-side-rendered SPA, a plain
+`fetch()`'s raw HTML often doesn't contain the real navigation links any
+more than it contains the real page content (see below), so this feature
+gets meaningfully better once Browser Rendering is configured. Without
+it, the Worker still works — it just falls back to the recommended list
+alone, same as before this feature existed.
+
+> **Known limitation:** discovered links are deduplicated by URL, not by
+> content — a homepage that links to itself under more than one path
+> (e.g. both `/` and `/home`) can result in one near-duplicate fetch.
+> Harmless (redundant content, not misleading content) but worth knowing
+> about if `pageStats` shows more pages than you expected.
 
 ## Handling JavaScript-rendered (SPA) pages
 
@@ -230,7 +300,7 @@ Set in [wrangler.toml](wrangler.toml) under `[vars]`:
 
 | Variable                     | Default | Description                                            |
 |------------------------------|---------|------------------------------------------------------------|
-| `MAX_PAGE_CHARS`             | `8000`  | Max characters of crawled text sent to the AI per request   |
+| `MAX_PAGE_CHARS`             | `30000` | Target total characters of crawled text sent to the AI per request (soft cap — see note below) |
 | `FETCH_TIMEOUT_MS`           | `8000`  | Timeout in ms per plain-fetch candidate page request         |
 | `BROWSER_RENDER_TIMEOUT_MS`  | `25000` | Timeout in ms per Browser Rendering fallback request         |
 | `CLOUDFLARE_ACCOUNT_ID`      | Unset   | Enables Browser Rendering (see above) when paired with `CLOUDFLARE_API_TOKEN` |
@@ -241,3 +311,13 @@ Set as a secret (not in `wrangler.toml`):
 |--------------------------|----------|---------------------------------------------------|
 | `API_KEY`                | No       | If set, required via `X-Api-Key` or `Authorization: Bearer` header |
 | `CLOUDFLARE_API_TOKEN`   | No       | Enables Browser Rendering (see above); needs "Browser Rendering - Edit" permission |
+
+`MAX_PAGE_CHARS` is a target, not a hard ceiling: every non-homepage page
+gets at least `MIN_OTHER_PAGE_CHARS` (2,500, a source constant, not
+configurable) regardless of how many pages succeeded, so the total sent
+to the AI can exceed `MAX_PAGE_CHARS` once homepage link discovery and
+the job-listing follow-up are pulling in a variable, often larger number
+of pages. A few other crawl-shaping values are source constants rather
+than env vars — `MAX_DISCOVERED_PATHS` (10) and the relevance/job-listing
+keyword lists in [src/index.js](src/index.js) — since they shape *what*
+gets crawled rather than *how long* a request is allowed to take.

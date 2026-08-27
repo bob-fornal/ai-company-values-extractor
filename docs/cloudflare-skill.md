@@ -102,6 +102,20 @@ simpler and cheaper than rendering) or is baked into the JS bundle itself
 with no API call at all (in which case only real rendering will surface
 it).
 
+### Link discovery has the same blind spot as content discovery
+
+If you're scraping a page's `<a href>` links (e.g. to find more pages to
+crawl), a plain `fetch()`'s raw HTML has the exact same problem as
+before: on a client-side-rendered SPA, the navigation itself is often
+rendered by JavaScript too, so the real links simply aren't in the raw
+HTML any more than the real page content was. The fix is the same fix —
+extract links from whatever Browser Rendering actually produced (in the
+`/markdown` case, from `[label](url)` syntax) rather than from the raw
+`fetch()` response. Practical implication: a link-discovery feature that
+depends on Browser Rendering having run will quietly find nothing on a
+plain `fetch()`-only page, without erroring — worth logging what it found
+(or didn't) rather than failing silently.
+
 ### Redirects with an explicit port in `Location` are fine
 
 A `301` `Location` header like `https://www.example.com:443/path`
@@ -268,6 +282,44 @@ badly with fan-out (`Promise.allSettled` over many `fetch()` calls at
 once, e.g. crawling a dozen candidate pages in parallel), where several
 unread bodies can pile up simultaneously and start causing spurious
 `AbortError`s on otherwise-fine requests.
+
+## Crawling adaptively instead of guessing
+
+A fixed list of likely paths (`/about`, `/careers`, `/values`, ...) is a
+reasonable starting point but will always miss some real sites — this
+project's own test site is a direct example: most of the guessed paths
+404'd, while the real navigation (different names entirely) was never
+guessed, and the actual values content lived only under `/careers` with
+no dedicated values/culture page at all. Two adaptations that generalize
+well beyond this project:
+
+- **Scrape the homepage's own links for more candidates.** Fetch the
+  homepage first (rather than in the same batch as everything else), pull
+  its same-origin links out, and treat any not already covered by the
+  guess list as additional candidates — capped, and ranked by whether the
+  URL itself hints at relevant content, so an unbounded nav/footer doesn't
+  turn into an unbounded crawl.
+- **Follow a link one level deeper when it's likely to matter.** A
+  careers page is a page *about* jobs; the actual content of interest
+  (values mentioned in a listing, for instance) can be one hop further
+  in, on an individual posting. Worth a narrow, targeted second fetch
+  rather than trying to guess that specific URL up front.
+
+**Watch the budget math when page count becomes variable.** Once "how
+many pages succeed" isn't a fixed number anymore, a context-building step
+that strictly divides a fixed total budget across N pages will shrink
+per-page shares as N grows — silently reintroducing a truncation bug that
+was already fixed once at a smaller, fixed N. Give each page a minimum
+floor instead of a strict share, and let the total sent grow with page
+count (bounded by the model's actual context window, not an arbitrary
+config value).
+
+**Deduplicate by URL, not by assumption.** A homepage can legitimately
+link to itself under more than one path (a logo link to `/home` alongside
+the real `/` route, for instance). URL-based dedup won't catch that — it's
+not the same URL — and catching it would require content-based
+comparison. Judge whether that complexity is worth it against the actual
+cost of an occasional redundant (not incorrect) fetch.
 
 ## Debugging workflow that actually worked here
 

@@ -19,8 +19,15 @@
  
 const MODEL = "@cf/meta/llama-4-scout-17b-16e-instruct";
  
-/** Sub-paths that frequently contain values/mission content. */
-const CANDIDATE_PATHS = [
+/**
+ * Recommended sub-paths that frequently contain values/mission content.
+ * This is a starting guess, not the whole crawl — the homepage is always
+ * fetched first and mined for its own real navigation links (see
+ * discoverPaths()), since a site's actual structure often doesn't match
+ * this list (e.g. no /values or /culture page at all, with everything
+ * living under /careers instead).
+ */
+const RECOMMENDED_PATHS = [
   "/",
   "/about",
   "/about-us",
@@ -123,12 +130,66 @@ async function handleExtract(request, env, includeReport) {
   const timeoutMs = parseInt(env.FETCH_TIMEOUT_MS ?? "8000", 10);
   const renderTimeoutMs = parseInt(env.BROWSER_RENDER_TIMEOUT_MS ?? "25000", 10);
 
-  // ── Crawl candidate pages ─────────────────────────────────────────────────
-  const crawlResults = await crawlPages(baseUrl, CANDIDATE_PATHS, timeoutMs, renderTimeoutMs, env);
+  // ── Fetch the homepage first so we can mine its own links ─────────────────
+  // (Its content also anchors buildContext()'s "homepage" budget below, so
+  // it must stay first in crawlResults regardless of what else is added.)
+  const rootResult = await fetchPage(`${baseUrl}/`, timeoutMs, renderTimeoutMs, env);
+  rootResult.discovery = "recommended";
+
+  // ── Recommended paths, plus real paths discovered from the homepage ───────
+  const discoveredPaths = discoverPaths(rootResult.links, RECOMMENDED_PATHS);
+  if (discoveredPaths.length > 0) {
+    console.warn(`Discovered ${discoveredPaths.length} path(s) from the homepage's own links: ${discoveredPaths.join(", ")}`);
+  }
+  const pathsToFetch = [...RECOMMENDED_PATHS.filter((p) => p !== "/"), ...discoveredPaths];
+
+  // ── Crawl the rest of the candidate pages ─────────────────────────────────
+  const restResults = await crawlPages(baseUrl, pathsToFetch, timeoutMs, renderTimeoutMs, env);
+  const discoveredSet = new Set(discoveredPaths);
+  restResults.forEach((r) => {
+    let pathname;
+    try {
+      pathname = new URL(r.url).pathname;
+    } catch {
+      pathname = null;
+    }
+    r.discovery = pathname && discoveredSet.has(pathname) ? "root-link" : "recommended";
+  });
+
+  const crawlResults = [rootResult, ...restResults];
+
+  // ── If a careers-style page came back, try to open one listed job ─────────
+  let jobListingPage = null;
+  const careersResult = crawlResults.find((r) => {
+    if (!r.ok) return false;
+    try {
+      return /career/i.test(new URL(r.url).pathname);
+    } catch {
+      return false;
+    }
+  });
+  if (careersResult) {
+    const jobLink = findJobListingLink(careersResult);
+    if (jobLink) {
+      console.warn(`Careers page at ${careersResult.url} — following job listing ${jobLink}`);
+      const jobResult = await fetchPage(jobLink, timeoutMs, renderTimeoutMs, env);
+      jobResult.discovery = "job-listing";
+      crawlResults.push(jobResult);
+      jobListingPage = { url: jobLink, ok: jobResult.ok };
+    } else {
+      console.warn(`Careers page at ${careersResult.url} — no individual job listing link found on it`);
+    }
+  }
+
   const sourcePages = crawlResults.filter((r) => r.ok).map((r) => r.url);
   const pageStats = crawlResults
     .filter((r) => r.ok)
-    .map((r) => ({ url: r.url, source: r.source ?? "plain", textLength: r.text.length }));
+    .map((r) => ({
+      url: r.url,
+      source: r.source ?? "plain",
+      discovery: r.discovery ?? "recommended",
+      textLength: r.text.length,
+    }));
   const skippedPages = crawlResults
     .filter((r) => !r.ok)
     .map((r) => ({ url: r.url, status: r.status ?? null, error: r.error ?? null }));
@@ -141,6 +202,7 @@ async function handleExtract(request, env, includeReport) {
     return jsonResponse({
       error: "Could not fetch any pages from the provided URL.",
       attempted: crawlResults.map((r) => r.url),
+      discoveredPaths,
       skippedPages,
     }, 502);
   }
@@ -163,6 +225,8 @@ async function handleExtract(request, env, includeReport) {
     sourcePages,
     pageStats,
     skippedPages,
+    discoveredPaths,
+    jobListingPage,
     model: MODEL,
     generatedAt: new Date().toISOString(),
   };
@@ -187,8 +251,80 @@ async function crawlPages(baseUrl, paths, timeoutMs, renderTimeoutMs, env) {
 
   return results.map((r, i) => {
     if (r.status === "fulfilled") return r.value;
-    return { url: `${baseUrl}${paths[i]}`, ok: false, text: "", error: r.reason?.message };
+    return { url: `${baseUrl}${paths[i]}`, ok: false, text: "", links: [], error: r.reason?.message };
   });
+}
+
+/** Keywords hinting a same-origin link is worth crawling for values/culture content. */
+const RELEVANT_LINK_KEYWORDS = [
+  "about", "career", "culture", "value", "mission", "vision", "team",
+  "story", "who", "why", "people", "life", "divers", "benefit", "difference",
+];
+const MAX_DISCOVERED_PATHS = 10;
+
+function linkRelevanceScore(pathname) {
+  const p = pathname.toLowerCase();
+  return RELEVANT_LINK_KEYWORDS.some((k) => p.includes(k)) ? 1 : 0;
+}
+
+/**
+ * Turn the homepage's own same-origin links into additional candidate
+ * paths not already covered by RECOMMENDED_PATHS. Ranked so links whose
+ * URL hints at values/culture/about-style content are kept first if there
+ * are more than the cap — a site's real nav often includes plenty of
+ * irrelevant links too (blog, contact, solutions) that aren't worth the
+ * extra fetch/render cost.
+ */
+function discoverPaths(rootLinks, recommendedPaths) {
+  const existing = new Set(recommendedPaths.map((p) => p.toLowerCase()));
+  const seen = new Set();
+  const candidates = [];
+
+  for (const link of rootLinks || []) {
+    let pathname;
+    try {
+      pathname = new URL(link).pathname;
+    } catch {
+      continue;
+    }
+    if (pathname.length > 1) pathname = pathname.replace(/\/$/, "");
+    if (!pathname) pathname = "/";
+    const key = pathname.toLowerCase();
+    if (key === "/" || existing.has(key) || seen.has(key)) continue;
+    seen.add(key);
+    candidates.push(pathname);
+  }
+
+  candidates.sort((a, b) => linkRelevanceScore(b) - linkRelevanceScore(a));
+  return candidates.slice(0, MAX_DISCOVERED_PATHS);
+}
+
+/** Keywords hinting a link on a careers page points at an individual job posting. */
+const JOB_LISTING_KEYWORDS = ["job", "position", "opening", "apply", "role"];
+
+/**
+ * Among a careers-style page's own discovered links, find one that looks
+ * like an individual job posting: either nested under the careers page's
+ * own path, or containing an obvious job-related keyword. Same-origin
+ * only — third-party ATS embeds (Greenhouse, Lever, Workday, etc.) live on
+ * a different origin and are out of scope here.
+ */
+function findJobListingLink(careersResult) {
+  const careersPath = new URL(careersResult.url).pathname.replace(/\/$/, "");
+
+  for (const link of careersResult.links || []) {
+    let linkPath;
+    try {
+      linkPath = new URL(link).pathname.replace(/\/$/, "");
+    } catch {
+      continue;
+    }
+    if (linkPath === careersPath) continue;
+    const nested = careersPath !== "" && linkPath.startsWith(careersPath + "/");
+    const keywordMatch = JOB_LISTING_KEYWORDS.some((k) => linkPath.toLowerCase().includes(k));
+    if (nested || keywordMatch) return link;
+  }
+  return null;
 }
 
 /**
@@ -259,17 +395,18 @@ async function fetchPagePlain(url, timeoutMs) {
     if (!res.ok) {
       console.warn(`Plain fetch failed for ${url}: HTTP ${res.status}`);
       await res.body?.cancel().catch(() => {});
-      return { url, ok: false, text: "", htmlLength: 0, status: res.status };
+      return { url, ok: false, text: "", htmlLength: 0, links: [], status: res.status };
     }
 
     const html = await res.text();
     const text = stripHtml(html);
+    const links = extractLinksFromHtml(html, url);
     const ok = text.length > 100;
     if (!ok) console.warn(`Plain fetch for ${url} returned only ${text.length} chars of text`);
-    return { url, ok, text, htmlLength: html.length, status: res.status, source: "plain" };
+    return { url, ok, text, htmlLength: html.length, links, status: res.status, source: "plain" };
   } catch (err) {
     console.warn(`Plain fetch threw for ${url}: ${err.name} — ${err.message}`);
-    return { url, ok: false, text: "", htmlLength: 0, error: err.message };
+    return { url, ok: false, text: "", htmlLength: 0, links: [], error: err.message };
   } finally {
     clearTimeout(timer);
   }
@@ -314,10 +451,13 @@ async function fetchPageViaBrowserRendering(url, timeoutMs, env) {
       return null;
     }
 
+    const links = extractLinksFromMarkdown(text, url);
+
     return {
       url,
       ok: true,
       text: text.replace(/\s{2,}/g, " ").trim(),
+      links,
       status: res.status,
       source: "browser-rendering",
     };
@@ -329,6 +469,55 @@ async function fetchPageViaBrowserRendering(url, timeoutMs, env) {
   }
 }
  
+/** File extensions that are never worth crawling as a "page". */
+const NON_PAGE_EXTENSION_RE = /\.(png|jpe?g|gif|svg|webp|css|js|pdf|ico|xml|json|zip|mp4|mp3|woff2?|ttf)$/i;
+
+/**
+ * Pull same-origin, page-like links out of page content and return them as
+ * deduplicated absolute URLs (query string and fragment stripped). Shared
+ * by both fetch paths — only the regex for finding a raw link differs.
+ */
+function extractLinks(content, pageUrl, linkRe) {
+  let origin;
+  try {
+    origin = new URL(pageUrl).origin;
+  } catch {
+    return [];
+  }
+
+  const found = new Set();
+  let match;
+  while ((match = linkRe.exec(content))) {
+    const href = match[1];
+    if (!href || href.startsWith("#") || /^(mailto|tel|javascript):/i.test(href)) continue;
+
+    let abs;
+    try {
+      abs = new URL(href, pageUrl);
+    } catch {
+      continue;
+    }
+    if (abs.origin !== origin) continue;
+    if (!/^https?:$/.test(abs.protocol)) continue;
+    if (NON_PAGE_EXTENSION_RE.test(abs.pathname)) continue;
+
+    abs.hash = "";
+    abs.search = "";
+    let clean = abs.toString();
+    if (clean.length > origin.length + 1 && clean.endsWith("/")) clean = clean.slice(0, -1);
+    found.add(clean);
+  }
+  return Array.from(found);
+}
+
+function extractLinksFromHtml(html, pageUrl) {
+  return extractLinks(html, pageUrl, /href\s*=\s*["']([^"']*)["']/gi);
+}
+
+function extractLinksFromMarkdown(markdown, pageUrl) {
+  return extractLinks(markdown, pageUrl, /\]\(([^)\s]+)\)/g);
+}
+
 /** Very lightweight HTML → plain-text: remove tags, decode common entities. */
 function stripHtml(html) {
   return html
@@ -352,13 +541,20 @@ function stripHtml(html) {
  
 /**
  * Combine successful page text, de-duplicate content, and cap total length.
- * The homepage gets a modest head start; other pages share the remainder
- * equally. Browser-rendered pages carry nav/logo/frontmatter markdown
- * overhead before any real body content starts, so per-page budgets need
- * real headroom — a page's actual content of interest can sit well past
- * the first ~1,500-2,000 characters even though that would look "enough"
- * for plain server-rendered HTML.
+ * The homepage gets a modest head start; other pages share the remainder,
+ * with a floor per page (MIN_OTHER_PAGE_CHARS) regardless of how many
+ * pages succeeded. Root-page link discovery and the careers/job-listing
+ * follow-up mean the successful-page count is now variable and often
+ * larger than the fixed recommended list alone — a strict even division
+ * would shrink per-page budgets right back into the truncation bug fixed
+ * earlier (a real page's content of interest cut off before the AI ever
+ * saw it, since Browser-rendered pages carry nav/logo/frontmatter overhead
+ * before any real body content starts). The tradeoff: total context sent
+ * can exceed maxTotalChars when many pages succeed — acceptable given the
+ * model's context window.
  */
+const MIN_OTHER_PAGE_CHARS = 2500;
+
 function buildContext(crawlResults, maxTotalChars) {
   const successful = crawlResults.filter((r) => r.ok && r.text.length > 0);
   if (successful.length === 0) return "";
@@ -367,8 +563,9 @@ function buildContext(crawlResults, maxTotalChars) {
   // budget — rather than the outsized share it had before, since every
   // page needs enough room to get past its own nav/frontmatter overhead.
   const homeBudget = Math.floor(maxTotalChars * 0.25);
-  const otherBudget = Math.floor((maxTotalChars - homeBudget) / Math.max(1, successful.length - 1));
- 
+  const computedShare = Math.floor((maxTotalChars - homeBudget) / Math.max(1, successful.length - 1));
+  const otherBudget = Math.max(MIN_OTHER_PAGE_CHARS, computedShare);
+
   const chunks = successful.map((r, i) => {
     const budget = i === 0 ? homeBudget : otherBudget;
     const snippet = r.text.slice(0, budget);

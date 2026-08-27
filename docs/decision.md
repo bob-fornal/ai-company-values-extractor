@@ -28,6 +28,14 @@ presentation of the debugging process, not as ongoing technical reference
 
 Issue 13's fix resolved it — confirmed working.
 
+| # | Change | Motivation | What Shipped |
+|---|--------|------------|---------------|
+| 14 | Adaptive page discovery + job-listing follow-up | The fixed recommended path list is a guess — leadingedje.com itself proved this: most of `RECOMMENDED_PATHS` 404'd, while its real nav (`/solutions`, `/blog`, `/contact`, etc.) wasn't guessed at all. Some companies also state values inside job postings rather than the careers page itself. | Homepage is scraped for its own links to find real candidate pages beyond the guess list; a careers-style page is checked for an individual job-listing link, which is fetched too if found. |
+
+Entry 14 is a deliberate enhancement requested after the extraction was
+already confirmed working (issue 13), not a bug fix — see below for the
+reasoning and tradeoffs behind it.
+
 ## Detailed timeline
 
 ### 1. Initial documentation
@@ -253,6 +261,64 @@ as much.
 **Outcome:** Confirmed working — the API now correctly returns
 leadingedje.com's real Core Values from `/careers`.
 
+### 14. Adaptive page discovery + job-listing follow-up
+
+**Ask:** Rework the crawl to use the recommended path list *and* a list
+scraped from the homepage itself; if a careers page turns up, open one of
+its listed jobs to check for values there too.
+
+**Motivation:** The entire debugging saga above (issues 4–13) played out
+against a site where most of `RECOMMENDED_PATHS` simply don't exist —
+leadingedje.com's real navigation (`/solutions`, `/ai-development`,
+`/client-success`, `/blog`, `/contact`) shares almost no overlap with the
+guessed list, and its actual values live only under `/careers` with no
+dedicated `/values` or `/culture` page. A fixed guess list will always
+have this failure mode on some sites. Scraping the homepage's own links
+finds a site's *actual* structure instead of only guessing at it. Job
+postings were added because some companies state their values inside
+individual listings rather than on the careers page itself.
+
+**Implementation:**
+- The homepage is fetched first (previously it was just one entry in the
+  parallel crawl). Its content — HTML or, more often, the Browser
+  Rendered markdown — is scraped for same-origin links
+  (`extractLinksFromHtml()` / `extractLinksFromMarkdown()`).
+- Links not already covered by `RECOMMENDED_PATHS` become additional
+  candidate paths (`discoverPaths()`), capped at 10 and ranked so
+  URLs hinting at relevant content (`about`, `career`, `culture`,
+  `value`, `mission`, `team`, `story`, `people`, etc.) sort first.
+- After the crawl, if any successful page's URL contains `career`, its
+  own discovered links are checked for something that looks like an
+  individual job posting (`findJobListingLink()`) — nested under the
+  careers page's path, or containing a keyword like `job`, `position`,
+  `opening`, `apply`, `role`. Same-origin only; a careers page embedding
+  a third-party ATS (Greenhouse, Lever, Workday) on a different domain
+  isn't followed.
+- `buildContext()`'s per-page budget changed from a strict even division
+  to a division with a 2,500-character floor per page
+  (`MIN_OTHER_PAGE_CHARS`) — with the page count now variable and often
+  larger than the fixed list alone, a strict division would have
+  reintroduced the exact truncation bug fixed in issue 13.
+- New response fields: `pageStats[].discovery` (`"recommended"` /
+  `"root-link"` / `"job-listing"`), `discoveredPaths`, `jobListingPage` —
+  consistent with the diagnostics-over-guessing pattern established
+  throughout issues 7–13.
+
+**Known limitation (accepted, not fixed):** discovered links are
+deduplicated by URL, not by content — a homepage linking to itself under
+more than one path (e.g. both `/` and `/home`, which is exactly what
+leadingedje.com's own logo link does) can produce one near-duplicate
+fetch. Judged low-cost (redundant content, not misleading content) versus
+the complexity of content-based deduplication.
+
+**Verified against leadingedje.com specifically:** its real careers page
+has no job board (just an email CTA), so `findJobListingLink()` correctly
+returns nothing for it — confirmed via a standalone Node test harness
+against realistic sample HTML/markdown (including a synthetic
+"has job links" case) rather than a live redeploy, since this is
+inherently harder to observe through `wrangler tail` alone than a crawl
+failure was.
+
 ## What changed in the codebase, end to end
 
 - `src/index.js`:
@@ -265,9 +331,20 @@ leadingedje.com's real Core Values from `/careers`.
     rendering?"
   - `skippedPages` / `pageStats` in the API response — diagnostics for
     which pages were used, how, and why others weren't
-  - `buildContext()` — rebalanced per-page character budget
+  - `buildContext()` — rebalanced per-page character budget, now with a
+    per-page floor (`MIN_OTHER_PAGE_CHARS`) so a larger, more variable
+    page count from discovery can't shrink budgets back below the fix
+    from issue 13
   - `console.warn` logging at every fetch/render decision and failure
     point
+  - `extractLinksFromHtml()` / `extractLinksFromMarkdown()` /
+    `discoverPaths()` — scrape the homepage's own same-origin links into
+    additional candidate paths beyond `RECOMMENDED_PATHS`
+  - `findJobListingLink()` — locate an individual job posting on a
+    careers-style page and fetch it too
+  - `pageStats[].discovery`, `discoveredPaths`, `jobListingPage` in the
+    API response — diagnostics for what was found and where each page
+    came from
 - `wrangler.toml`:
   - `workers_dev` / `preview_urls` set explicitly
   - `CLOUDFLARE_ACCOUNT_ID` (var) / `CLOUDFLARE_API_TOKEN` (secret) for
@@ -306,3 +383,9 @@ leadingedje.com's real Core Values from `/careers`.
    deploy flow (the invalid rules block, and the account ID reverting).
    Worth solving as a process problem, not just re-fixing the symptom
    each time.
+5. **A fixed guess list will always miss some sites.** The entire saga
+   above played out against a site where most of the recommended paths
+   simply didn't exist and the real values lived somewhere never guessed
+   at. Scraping a site's actual structure (its homepage's own links)
+   catches what a static list can't — worth building in from the start
+   for any crawler making assumptions about site layout.
