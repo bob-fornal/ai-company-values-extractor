@@ -62,6 +62,10 @@ export default {
       if (url.pathname === "/" && request.method === "GET") {
         return handleHealth();
       }
+
+      if (isAuthenticated(request, env) === false) {
+        return new Response("Unauthorized", { status: 401 });
+      }
  
       if (url.pathname === "/extract" && request.method === "POST") {
         return handleExtract(request, env, false);
@@ -78,6 +82,12 @@ export default {
     }
   },
 };
+
+// --- Check for API key if configured
+function isAuthenticated(request, env) {
+  const authHeader = request.headers.get("x-api-key");
+  return authHeader === env.X_API_KEY;
+}
  
 // ─── Route handlers ───────────────────────────────────────────────────────────
  
