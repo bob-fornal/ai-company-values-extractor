@@ -1,0 +1,16 @@
+name = "company-values-extractor"
+main = "src/index.js"
+compatibility_date = "2024-11-01"
+compatibility_flags = ["nodejs_compat"]
+workers_dev = true
+preview_urls = true
+
+[ai]
+binding = "AI"
+
+[vars]
+# Max characters of crawled text sent to the AI per request, split evenly
+# across successful pages (see buildContext() in src/index.js).
+MAX_PAGE_CHARS = "8000"
+# Request timeout in milliseconds for each candidate page fetch
+FETCH_TIMEOUT_MS = "8000"

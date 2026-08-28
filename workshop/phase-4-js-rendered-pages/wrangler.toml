@@ -1,0 +1,30 @@
+name = "company-values-extractor"
+main = "src/index.js"
+compatibility_date = "2024-11-01"
+compatibility_flags = ["nodejs_compat"]
+workers_dev = true
+preview_urls = true
+
+[ai]
+binding = "AI"
+
+[vars]
+MAX_PAGE_CHARS = "8000"
+FETCH_TIMEOUT_MS = "8000"
+# Timeout in milliseconds for the Browser Rendering /markdown fallback — this
+# needs more headroom than a plain fetch since it spins up a real browser and
+# waits for the page's JavaScript to render.
+BROWSER_RENDER_TIMEOUT_MS = "25000"
+
+# Optional: your Cloudflare account ID. Set this (as a var, not a secret — it
+# is not sensitive on its own) together with the CLOUDFLARE_API_TOKEN secret
+# below to enable rendering candidate pages that look client-side-rendered.
+# CLOUDFLARE_ACCOUNT_ID = "your-account-id"
+
+# Required alongside CLOUDFLARE_ACCOUNT_ID above. NEVER put this in [vars] —
+# see Phase 3's case study. Set it with:
+#
+#   wrangler secret put CLOUDFLARE_API_TOKEN
+#
+# Create the token at https://dash.cloudflare.com/profile/api-tokens with the
+# "Browser Rendering - Edit" permission.

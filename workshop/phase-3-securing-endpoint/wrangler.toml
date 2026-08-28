@@ -1,0 +1,18 @@
+name = "company-values-extractor"
+main = "src/index.js"
+compatibility_date = "2024-11-01"
+compatibility_flags = ["nodejs_compat"]
+workers_dev = true
+preview_urls = true
+
+[ai]
+binding = "AI"
+
+[vars]
+MAX_PAGE_CHARS = "8000"
+FETCH_TIMEOUT_MS = "8000"
+
+# API_KEY is intentionally NOT here. It's a credential — it must be set as a
+# secret (see README's case study), never as a plaintext var. Set it with:
+#
+#   wrangler secret put API_KEY
